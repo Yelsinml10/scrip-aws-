@@ -10,400 +10,288 @@ NC='\033[0m' # Sin color
 
 # --- Función para instalar dependencias ---
 instalar_dependencias() {
-    if ! command -v jq &> /dev/null; then
-        echo -e "${YELLOW}[*] Instalando 'jq' (requerido para procesar JSON)...${NC}"
-        if [ -n "$(command -v apt)" ]; then sudo apt-get update -qq && sudo apt-get install -y jq -qq;
-        elif [ -n "$(command -v yum)" ]; then sudo yum install -y jq -q;
+    for cmd in jq aws openssl; do
+        if ! command -v $cmd &> /dev/null; then
+            echo -e "${YELLOW}[*] Instalando '$cmd'...${NC}"
+            if [ -n "$(command -v apt)" ]; then sudo apt-get update -qq && sudo apt-get install -y $cmd -qq;
+            elif [ -n "$(command -v yum)" ]; then sudo yum install -y $cmd -q;
+            fi
         fi
+    done
+}
+
+# --- Verificar configuración de AWS ---
+check_aws() {
+    if ! aws sts get-caller-identity &> /dev/null; then
+        echo -e "${RED}[X] Error: AWS CLI no está configurado o las credenciales son inválidas.${NC}"
+        echo -e "${YELLOW}Por favor, ejecuta 'aws configure' primero.${NC}"
+        read -p "Presione ENTER para volver..."
+        return 1
     fi
+    return 0
 }
 
 # --- 1. Función: AWS CloudFront (Crear) ---
 crear_cloudfront() {
+    check_aws || return
     clear
     echo -e "${CYAN}====================================================${NC}"
     echo -e "${CYAN}      CREAR DISTRIBUCIÓN EN AWS CLOUDFRONT          ${NC}"
     echo -e "${CYAN}====================================================${NC}"
-    read -p "Ingrese el dominio personalizado/Alias (ej. cdn.freenethn.org): " CUSTOM_DOMAIN
-    read -p "Ingrese el dominio o IP de origen (ej. xxxx.vps.com o tu IP): " ORIGIN_DOMAIN
+    read -p "Ingrese el dominio personalizado/Alias (ej. cdn.tudominio.com): " CUSTOM_DOMAIN
+    read -p "Ingrese el dominio o IP de origen (ej. vps.dominio.com): " ORIGIN_DOMAIN
 
     if [ -z "$CUSTOM_DOMAIN" ] || [ -z "$ORIGIN_DOMAIN" ]; then
-        echo -e "${RED}[X] Error: Ambos dominios son obligatorios. Operación cancelada.${NC}"
+        echo -e "${RED}[X] Error: Datos incompletos.${NC}"
         return
     fi
 
-    echo -e "\n${YELLOW}[*] Obteniendo certificados de AWS Certificate Manager (us-east-1)...${NC}"
-    
-    CERT_DATA=$(aws acm list-certificates --region us-east-1 --query "CertificateSummaryList[*].[CertificateArn, DomainName]" --output text 2>/dev/null)
+    echo -e "\n${YELLOW}[*] Buscando certificados en us-east-1...${NC}"
+    CERT_DATA=$(aws acm list-certificates --region us-east-1 --certificate-statuses ISSUED --query "CertificateSummaryList[*].[CertificateArn, DomainName]" --output text)
 
-    if [ -z "$CERT_DATA" ] || [[ "$CERT_DATA" == "None" ]]; then
-        echo -e "${RED}[X] No se encontraron certificados en us-east-1.${NC}"
-        read -p "Ingrese el ARN del certificado manualmente: " CERT_ARN
-    else
-        echo -e "\n${CYAN}--- Certificados Disponibles ---${NC}"
-        INDEX=1
-        declare -A CERT_MAP
-        
-        while IFS=$'\t' read -r ARN DOMAIN; do
-            if [ -n "$ARN" ]; then
-                echo -e " ${YELLOW}$INDEX)${NC} Dominio: ${GREEN}$DOMAIN${NC}"
-                CERT_MAP[$INDEX]=$ARN
-                ((INDEX++))
-            fi
-        done <<< "$CERT_DATA"
-        echo -e "${CYAN}----------------------------------${NC}"
-
-        read -p "Seleccione el número del certificado a usar (1-$((INDEX-1))): " CERT_SELECCION
-
-        if ! [[ "$CERT_SELECCION" =~ ^[0-9]+$ ]] || [ -z "${CERT_MAP[$CERT_SELECCION]}" ]; then
-            echo -e "${RED}[X] Selección inválida.${NC}"
-            read -p "Ingrese el ARN del certificado manualmente: " CERT_ARN
-        else
-            CERT_ARN="${CERT_MAP[$CERT_SELECCION]}"
-        fi
+    if [ -z "$CERT_DATA" ]; then
+        echo -e "${RED}[X] No hay certificados VALIDADOS en us-east-1.${NC}"
+        return
     fi
+
+    echo -e "\n${CYAN}--- Certificados Disponibles ---${NC}"
+    INDEX=1
+    declare -A CERT_MAP
+    while IFS=$'\t' read -r ARN DOMAIN; do
+        echo -e " ${YELLOW}$INDEX)${NC} $DOMAIN"
+        CERT_MAP[$INDEX]=$ARN
+        ((INDEX++))
+    done <<< "$CERT_DATA"
+
+    read -p "Seleccione el certificado (1-$((INDEX-1))): " CERT_SELECCION
+    CERT_ARN="${CERT_MAP[$CERT_SELECCION]}"
 
     if [ -z "$CERT_ARN" ]; then
-        echo -e "${RED}[X] Error: Es obligatorio asignar un certificado para la distribución.${NC}"
+        echo -e "${RED}[X] Selección inválida.${NC}"
         return
     fi
 
-    echo -e "\n${YELLOW}[*] Certificado seleccionado: ${GREEN}$CERT_ARN${NC}"
-    echo -e "${YELLOW}[*] Generando configuración optimizada para gRPC sobre HTTP/2...${NC}"
+    # Generar CallerReference única con nanosegundos
+    CALLER_REFERENCE="vpn-$(date +%s%N)"
 
-    CALLER_REFERENCE=$(date +%s)
-
-cat <<JSON > cf-config.json
+    echo -e "${YELLOW}[*] Creando configuración JSON...${NC}"
+    cat <<JSON > cf-config.json
 {
     "CallerReference": "$CALLER_REFERENCE",
-    "Aliases": {
-        "Quantity": 1,
-        "Items": [
-            "$CUSTOM_DOMAIN"
-        ]
-    },
-    "DefaultRootObject": "",
+    "Aliases": { "Quantity": 1, "Items": ["$CUSTOM_DOMAIN"] },
     "Origins": {
         "Quantity": 1,
         "Items": [
             {
-                "Id": "Origin-$ORIGIN_DOMAIN",
+                "Id": "Origin-1",
                 "DomainName": "$ORIGIN_DOMAIN",
-                "OriginPath": "",
-                "CustomHeaders": {
-                    "Quantity": 0
-                },
                 "CustomOriginConfig": {
-                    "HTTPPort": 80,
-                    "HTTPSPort": 443,
+                    "HTTPPort": 80, "HTTPSPort": 443,
                     "OriginProtocolPolicy": "match-viewer",
-                    "OriginSslProtocols": {
-                        "Quantity": 1,
-                        "Items": ["TLSv1.2"]
-                    },
-                    "OriginReadTimeout": 30,
-                    "OriginKeepaliveTimeout": 5
+                    "OriginSslProtocols": { "Quantity": 1, "Items": ["TLSv1.2"] }
                 }
             }
         ]
     },
     "DefaultCacheBehavior": {
-        "TargetOriginId": "Origin-$ORIGIN_DOMAIN",
+        "TargetOriginId": "Origin-1",
         "ForwardedValues": {
             "QueryString": true,
-            "Cookies": {
-                "Forward": "all"
-            },
-            "Headers": {
-                "Quantity": 1,
-                "Items": ["*"]
-            }
+            "Cookies": { "Forward": "all" },
+            "Headers": { "Quantity": 1, "Items": ["*"] }
         },
-        "TrustedSigners": {
-            "Enabled": false,
-            "Quantity": 0
-        },
+        "TrustedSigners": { "Enabled": false, "Quantity": 0 },
         "ViewerProtocolPolicy": "allow-all",
-        "MinTTL": 0,
-        "AllowedMethods": {
-            "Quantity": 7,
-            "Items": ["HEAD", "DELETE", "POST", "GET", "OPTIONS", "PUT", "PATCH"],
-            "CachedMethods": {
-                "Quantity": 2,
-                "Items": ["HEAD", "GET"]
-            }
-        },
-        "SmoothStreaming": false,
-        "DefaultTTL": 0,
-        "MaxTTL": 0,
-        "Compress": false
+        "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 0
     },
-    "CacheBehaviors": {
-        "Quantity": 0
-    },
-    "CustomErrorResponses": {
-        "Quantity": 0
-    },
-    "Comment": "Distribucion optimizada para VPN/gRPC - $CUSTOM_DOMAIN",
-    "Logging": {
-        "Enabled": false,
-        "IncludeCookies": false,
-        "Bucket": "",
-        "Prefix": ""
-    },
-    "PriceClass": "PriceClass_All",
     "Enabled": true,
+    "Comment": "VPN gRPC - $CUSTOM_DOMAIN",
     "ViewerCertificate": {
         "ACMCertificateArn": "$CERT_ARN",
         "SSLSupportMethod": "sni-only",
-        "MinimumProtocolVersion": "TLSv1.2_2021",
-        "CloudFrontDefaultCertificate": false
+        "MinimumProtocolVersion": "TLSv1.2_2021"
     },
-    "Restrictions": {
-        "GeoRestriction": {
-            "RestrictionType": "none",
-            "Quantity": 0
-        }
-    },
-    "WebACLId": "",
-    "HttpVersion": "http2",
-    "IsIPV6Enabled": true
+    "HttpVersion": "http2"
 }
 JSON
 
-    echo -e "${YELLOW}[*] Enviando solicitud a AWS CloudFront...${NC}"
-    aws cloudfront create-distribution --distribution-config file://cf-config.json
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}----------------------------------------------------${NC}"
-        echo -e "${GREEN}[✓] ¡Distribución creada exitosamente para $CUSTOM_DOMAIN!${NC}"
-        echo -e "${GREEN}----------------------------------------------------${NC}"
-    else
-        echo -e "${RED}----------------------------------------------------${NC}"
-        echo -e "${RED}[X] Hubo un error al intentar crear la distribución.${NC}"
-        echo -e "${RED}----------------------------------------------------${NC}"
-    fi
+    echo -e "${YELLOW}[*] Enviando a AWS (esto puede tardar)...${NC}"
+    RESULT=$(aws cloudfront create-distribution --distribution-config file://cf-config.json 2>&1)
     
+    if [ $? -eq 0 ]; then
+        ID=$(echo "$RESULT" | jq -r '.Distribution.Id')
+        DOMAIN=$(echo "$RESULT" | jq -r '.Distribution.DomainName')
+        echo -e "${GREEN}[✓] Creado con éxito! ID: $ID${NC}"
+        echo -e "${GREEN}[✓] Host de CloudFront: $DOMAIN${NC}"
+        echo -e "${YELLOW}[!] Recuerda apuntar $CUSTOM_DOMAIN -> $DOMAIN en Cloudflare (CNAME).${NC}"
+    else
+        echo -e "${RED}[X] Error al crear:${NC}\n$RESULT"
+    fi
     rm -f cf-config.json
 }
 
 # --- 2. Función: Solicitar Certificado AWS ACM ---
 solicitar_acm() {
+    check_aws || return
     clear
     echo -e "${CYAN}====================================================${NC}"
     echo -e "${CYAN}   SOLICITAR CERTIFICADO PÚBLICO EN AWS ACM         ${NC}"
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${YELLOW}Este certificado es el que usarás en CloudFront.${NC}\n"
+    read -p "Ingrese el dominio (ej. cdn.tudominio.com): " ACM_DOMAIN
 
-    read -p "Ingrese el dominio (ej. cdn.tudominio.com o *.tudominio.com): " ACM_DOMAIN
+    echo -e "${YELLOW}[*] Solicitando certificado...${NC}"
+    CERT_ARN=$(aws acm request-certificate --domain-name "$ACM_DOMAIN" --validation-method DNS --region us-east-1 --query "CertificateArn" --output text)
 
-    if [ -z "$ACM_DOMAIN" ]; then
-        echo -e "${RED}[X] El dominio es obligatorio.${NC}"
-        return
-    fi
-
-    echo -e "\n${YELLOW}[*] Solicitando certificado a AWS ACM...${NC}"
-    CERT_ARN=$(aws acm request-certificate --domain-name "$ACM_DOMAIN" --validation-method DNS --region us-east-1 --query "CertificateArn" --output text 2>/dev/null)
-
-    if [ -z "$CERT_ARN" ]; then
-        echo -e "${RED}[X] Error al solicitar. Revisa tus permisos o si el dominio es válido.${NC}"
-        return
-    fi
-
-    echo -e "${GREEN}[✓] ¡Certificado solicitado! Estado: PENDIENTE DE VALIDACIÓN.${NC}"
-    echo -e "${YELLOW}[*] Obteniendo los registros DNS (CNAME) necesarios...${NC}"
+    echo -e "${YELLOW}[*] Esperando a que AWS genere los registros de validación...${NC}"
     
-    sleep 5 # Pausa breve para que AWS genere los registros
-    
-    aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 \
-        --query "Certificate.DomainValidationOptions[*].[DomainName, ResourceRecord.Name, ResourceRecord.Value]" \
-        --output table
-
-    echo -e "\n${RED}>>> IMPORTANTE <<<${NC}"
-    echo -e "1. Ve a Cloudflare (o tu proveedor de DNS)."
-    echo -e "2. Crea un registro tipo ${CYAN}CNAME${NC}."
-    echo -e "3. Pega el Nombre (Name) y el Valor (Value) que aparecen en la tabla de arriba."
-    echo -e "4. Guarda los cambios en Cloudflare y desactiva la nube naranja (Proxy status: DNS only)."
-    echo -e "----------------------------------------------------"
-    
-    read -p "Presione ENTER *SOLO DESPUÉS* de haber guardado el CNAME en su DNS para verificar si se activa..."
-    
-    echo -e "\n${YELLOW}[*] Verificando estado en AWS (esto suele tomar de 1 a 3 minutos, espera un momento)...${NC}"
-    
-    for i in {1..20}; do
-        STATUS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 --query "Certificate.Status" --output text)
-        
-        if [ "$STATUS" == "ISSUED" ]; then
-            echo -e "\n\n${GREEN}====================================================${NC}"
-            echo -e "${GREEN}[✓] ¡Excelente! El certificado ha sido validado y está ACTIVO.${NC}"
-            echo -e "${GREEN}[✓] Ya puedes usar la Opción 1 para crear tu distribución.${NC}"
-            echo -e "${GREEN}====================================================${NC}"
-            break
-        elif [ "$STATUS" == "FAILED" ]; then
-            echo -e "\n\n${RED}[X] Error: La validación falló. Revisa si el CNAME es correcto.${NC}"
-            break
-        else
-            echo -ne "${CYAN}*${NC}"
-            sleep 15
-        fi
+    # Bucle para esperar a que los registros DNS estén listos en la API de AWS
+    for i in {1..10}; do
+        VALIDATION_DATA=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 --query "Certificate.DomainValidationOptions[0].ResourceRecord" --output json)
+        if [ "$VALIDATION_DATA" != "null" ]; then break; fi
+        sleep 3
     done
 
-    if [ "$STATUS" == "PENDING_VALIDATION" ]; then
-        echo -e "\n\n${YELLOW}[!] El tiempo de espera terminó, pero el certificado sigue pendiente.${NC}"
-        echo -e "${YELLOW}A veces Cloudflare tarda un poco más en propagar. AWS seguirá intentando en segundo plano.${NC}"
-        echo -e "Puedes intentar crear la distribución más tarde.${NC}"
+    if [ "$VALIDATION_DATA" == "null" ]; then
+        echo -e "${RED}[X] AWS está tardando demasiado en generar registros. Intenta listar luego.${NC}"
+        return
     fi
+
+    NAME=$(echo "$VALIDATION_DATA" | jq -r '.Name')
+    VALUE=$(echo "$VALIDATION_DATA" | jq -r '.Value')
+
+    echo -e "\n${GREEN}>>> REGISTRO CNAME PARA CLOUDFLARE <<<${NC}"
+    echo -e "${CYAN}Nombre:${NC} $NAME"
+    echo -e "${CYAN}Valor :${NC} $VALUE"
+    echo -e "----------------------------------------------------"
+    echo -e "${RED}NOTA: Desactiva el Proxy (Nube Naranja) en Cloudflare.${NC}"
+    
+    read -p "Presione ENTER cuando haya agregado el DNS para verificar el estado..."
+    
+    echo -e "${YELLOW}[*] Verificando validación (puede tardar minutos)...${NC}"
+    while true; do
+        STATUS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 --query "Certificate.Status" --output text)
+        if [ "$STATUS" == "ISSUED" ]; then
+            echo -e "${GREEN}[✓] ¡Certificado EMITIDO y listo para usar!${NC}"
+            break
+        elif [ "$STATUS" == "FAILED" ]; then
+            echo -e "${RED}[X] La validación falló.${NC}"; break
+        fi
+        echo -ne "${CYAN}.${NC}"
+        sleep 10
+    done
 }
 
-# --- 3. Función: Cloudflare Origin CA (ACTUALIZADA PARA TOKENS) ---
+# --- 3. Función: Cloudflare Origin CA ---
 crear_cloudflare() {
     clear
     echo -e "${CYAN}====================================================${NC}"
     echo -e "${CYAN}   CREAR CERTIFICADO ORIGIN CA (CLOUDFLARE)         ${NC}"
     echo -e "${CYAN}====================================================${NC}"
     instalar_dependencias
-    
-    echo -e "${YELLOW}Nota: Este es el certificado para tu VPS/Servidor backend.${NC}\n"
-    
-    read -p "Ingrese el dominio para el certificado (ej. vpn.dominio.com): " CF_DOMAIN
-    read -s -p "Ingrese su Token de API de Cloudflare (ej. cfut_...): " CF_API_KEY
-    echo -e "\n"
+    read -p "Dominio (ej. vpn.tudominio.com): " CF_DOMAIN
+    read -p "API Token de Cloudflare: " CF_API_KEY
 
-    if [ -z "$CF_DOMAIN" ] || [ -z "$CF_API_KEY" ]; then
-        echo -e "${RED}[X] Error: El dominio y el Token de API son obligatorios.${NC}"
-        return
-    fi
-
-    echo -e "${YELLOW}[*] Generando clave y solicitando a Cloudflare...${NC}"
     openssl genrsa -out "$CF_DOMAIN.key" 2048 2>/dev/null
-    openssl req -new -key "$CF_DOMAIN.key" -out "$CF_DOMAIN.csr" -subj "/C=US/ST=State/L=City/O=VPN/CN=$CF_DOMAIN" 2>/dev/null
+    CSR=$(openssl req -new -key "$CF_DOMAIN.key" -subj "/CN=$CF_DOMAIN" | awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}')
 
-    CSR_FORMATTED=$(awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}' "$CF_DOMAIN.csr")
-
-    # AQUI ESTA EL CAMBIO: Uso de "Authorization: Bearer" en lugar de "X-Auth-User-Service-Key"
     RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/certificates" \
         -H "Authorization: Bearer $CF_API_KEY" \
         -H "Content-Type: application/json" \
-        --data '{"hostnames":["'"$CF_DOMAIN"'"],"requested_validity":5475,"request_type":"origin-rsa","csr":"'"$CSR_FORMATTED"'"}')
+        --data '{"hostnames":["'"$CF_DOMAIN"'"],"requested_validity":5475,"request_type":"origin-rsa","csr":"'"$CSR"'"}')
 
-    CERT=$(echo "$RESPONSE" | jq -r '.result.certificate')
-
-    if [ "$CERT" != "null" ] && [ -n "$CERT" ]; then
-        echo -e "$CERT" > "$CF_DOMAIN.pem"
-        echo -e "${GREEN}----------------------------------------------------${NC}"
-        echo -e "${GREEN}[✓] ¡Certificado creado exitosamente (Válido por 15 años)!${NC}"
-        echo -e "${GREEN}    🔑 Ruta clave privada : $(pwd)/$CF_DOMAIN.key${NC}"
-        echo -e "${GREEN}    📜 Ruta certificado   : $(pwd)/$CF_DOMAIN.pem${NC}"
-        echo -e "${GREEN}----------------------------------------------------${NC}"
+    if echo "$RESPONSE" | jq -e '.success' > /dev/null; then
+        echo "$RESPONSE" | jq -r '.result.certificate' > "$CF_DOMAIN.pem"
+        echo -e "${GREEN}[✓] Certificado guardado como $CF_DOMAIN.pem y $CF_DOMAIN.key${NC}"
     else
-        echo -e "${RED}[X] Error al generar el certificado en Cloudflare:${NC}"
+        echo -e "${RED}[X] Error de Cloudflare:${NC}"
         echo "$RESPONSE" | jq -r '.errors[0].message'
     fi
-
-    rm -f "$CF_DOMAIN.csr"
 }
 
 # --- 4. Función: Listar Distribuciones ---
 listar_distribuciones() {
+    check_aws || return
     clear
     echo -e "${CYAN}====================================================${NC}"
     echo -e "${CYAN}       LISTA DE DISTRIBUCIONES (CLOUDFRONT)         ${NC}"
     echo -e "${CYAN}====================================================${NC}"
-    echo -e "${YELLOW}[*] Obteniendo datos desde AWS...${NC}\n"
-    
-    aws cloudfront list-distributions \
-        --query "DistributionList.Items[*].[Id, DomainName, Status, Comment]" \
-        --output table
+    aws cloudfront list-distributions --query "DistributionList.Items[*].[Id, DomainName, Status, Enabled, Comment]" --output table
 }
 
-# --- 5. Función: Eliminar Distribución con Menú de Selección ---
+# --- 5. Función: Gestionar / Eliminar ---
 eliminar_distribucion() {
+    check_aws || return
     clear
     echo -e "${CYAN}====================================================${NC}"
     echo -e "${CYAN}         GESTIONAR / ELIMINAR DISTRIBUCIÓN          ${NC}"
     echo -e "${CYAN}====================================================${NC}"
     
-    echo -e "${YELLOW}[*] Consultando distribuciones...${NC}"
-    DIST_DATA=$(aws cloudfront list-distributions --query "DistributionList.Items[*].[Id, DomainName, Status]" --output text 2>/dev/null)
-    
-    if [ -z "$DIST_DATA" ] || [[ "$DIST_DATA" == "None" ]]; then
-        echo -e "${RED}[X] No hay distribuciones disponibles en tu cuenta.${NC}"
-        return
-    fi
+    DIST_DATA=$(aws cloudfront list-distributions --query "DistributionList.Items[*].[Id, DomainName, Status, Enabled]" --output text)
+    if [ -z "$DIST_DATA" ]; then echo "No hay distribuciones."; return; fi
 
-    echo -e "\n${CYAN}--- Distribuciones Disponibles ---${NC}"
+    echo -e "N°  | ID | Dominio | Estado | Habilitada"
     INDEX=1
-    declare -A DIST_MAP
-    
-    while IFS=$'\t' read -r ID DOMAIN STATUS; do
-        if [ -n "$ID" ]; then
-            echo -e " ${YELLOW}$INDEX)${NC} ID: ${GREEN}$ID${NC} | Dominio: $DOMAIN | Estado: $STATUS"
-            DIST_MAP[$INDEX]=$ID
-            ((INDEX++))
-        fi
+    declare -A MAP_ID
+    while IFS=$'\t' read -r ID DOMAIN STATUS ENABLED; do
+        echo -e "${YELLOW}$INDEX)${NC} $ID | $DOMAIN | $STATUS | $ENABLED"
+        MAP_ID[$INDEX]=$ID
+        ((INDEX++))
     done <<< "$DIST_DATA"
-    echo -e "${CYAN}----------------------------------${NC}"
 
-    read -p "Seleccione el número de la distribución a gestionar (1-$((INDEX-1))): " SELECCION
+    read -p "Seleccione número: " SEL
+    ID_SEL="${MAP_ID[$SEL]}"
+    [ -z "$ID_SEL" ] && return
 
-    if ! [[ "$SELECCION" =~ ^[0-9]+$ ]] || [ -z "${DIST_MAP[$SELECCION]}" ]; then
-        echo -e "${RED}[X] Selección inválida. Operación cancelada.${NC}"
-        return
-    fi
+    CONFIG=$(aws cloudfront get-distribution --id "$ID_SEL")
+    ETAG=$(echo "$CONFIG" | jq -r '.ETag')
+    ENABLED=$(echo "$CONFIG" | jq -r '.Distribution.DistributionConfig.Enabled')
+    STATUS=$(echo "$CONFIG" | jq -r '.Distribution.Status')
 
-    DIST_ID="${DIST_MAP[$SELECCION]}"
-    echo -e "\n${YELLOW}[*] Has seleccionado la distribución: ${GREEN}$DIST_ID${NC}"
-    
-    ETAG=$(aws cloudfront get-distribution --id "$DIST_ID" --query "ETag" --output text 2>/dev/null)
-    ENABLED=$(aws cloudfront get-distribution-config --id "$DIST_ID" --query "DistributionConfig.Enabled" --output text)
-
-    if [ "$ENABLED" == "True" ]; then
-        echo -e "${RED}[!] La distribución actualmente está HABILITADA y no se puede eliminar.${NC}"
-        read -p "¿Desea DESHABILITARLA ahora? (s/n): " CONFIRM
-        if [[ "$CONFIRM" =~ ^[Ss]$ ]]; then
-            aws cloudfront get-distribution-config --id "$DIST_ID" | jq '.DistributionConfig | .Enabled = false' > updated_config.json
-            aws cloudfront update-distribution --id "$DIST_ID" --if-match "$ETAG" --distribution-config file://updated_config.json > /dev/null
-            echo -e "${GREEN}[✓] Distribución deshabilitada con éxito. Regresa en unos minutos para eliminarla permanentemente.${NC}"
-            rm -f updated_config.json
+    if [ "$ENABLED" == "true" ]; then
+        read -p "La distribución está activa. ¿Desea DESHABILITARLA? (s/n): " OPT
+        if [[ "$OPT" =~ ^[Ss]$ ]]; then
+            NEW_CONF=$(echo "$CONFIG" | jq '.Distribution.DistributionConfig | .Enabled = false')
+            echo "$NEW_CONF" > temp.json
+            aws cloudfront update-distribution --id "$ID_SEL" --if-match "$ETAG" --distribution-config file://temp.json > /dev/null
+            echo -e "${GREEN}[✓] Deshabilitando... Espera a que el estado sea 'Deployed' para borrar.${NC}"
+            rm temp.json
         fi
     else
-        echo -e "${GREEN}[✓] La distribución ya se encuentra DESHABILITADA.${NC}"
-        read -p "¿Desea ELIMINARLA permanentemente ahora? (s/n): " CONFIRM
-        if [[ "$CONFIRM" =~ ^[Ss]$ ]]; then
-            aws cloudfront delete-distribution --id "$DIST_ID" --if-match "$ETAG"
-            if [ $? -eq 0 ]; then
-                echo -e "${GREEN}[✓] ¡Distribución $DIST_ID eliminada exitosamente!${NC}"
-            else
-                echo -e "${RED}[X] Error al eliminar. Asegúrate de que el estado sea 'Deployed' y no 'InProgress'.${NC}"
-            fi
+        if [ "$STATUS" == "Deployed" ]; then
+            read -p "¿Eliminar PERMANENTEMENTE? (s/n): " OPT
+            [[ "$OPT" =~ ^[Ss]$ ]] && aws cloudfront delete-distribution --id "$ID_SEL" --if-match "$ETAG" && echo -e "${GREEN}[✓] Eliminada.${NC}"
+        else
+            echo -e "${RED}[!] El estado es '$STATUS'. Debe ser 'Deployed' para eliminar.${NC}"
         fi
     fi
 }
 
-# --- Menú Principal en Bucle ---
+# --- Bucle Principal ---
+instalar_dependencias
 while true; do
     clear
     echo -e "${GREEN}====================================================${NC}"
-    echo -e "${GREEN}       GESTOR AVANZADO: AWS & CLOUDFLARE VPN        ${NC}"
+    echo -e "${GREEN}       GESTOR PRO: AWS & CLOUDFLARE VPN             ${NC}"
     echo -e "${GREEN}====================================================${NC}"
-    echo -e " ${CYAN}1)${NC} Crear distribución en AWS CloudFront"
-    echo -e " ${CYAN}2)${NC} Solicitar y Validar Certificado en AWS ACM"
-    echo -e " ${CYAN}3)${NC} Generar Certificado de Origen VPS (Cloudflare)"
-    echo -e " ${CYAN}4)${NC} Listar distribuciones (AWS CloudFront)"
-    echo -e " ${CYAN}5)${NC} Gestionar / Eliminar distribución (AWS CloudFront)"
-    echo -e " ${CYAN}6)${NC} Salir"
+    echo -e " 1) Crear CloudFront (CDN)"
+    echo -e " 2) Solicitar Certificado ACM (SSL)"
+    echo -e " 3) Generar Certificado Origen (Cloudflare)"
+    echo -e " 4) Listar Distribuciones"
+    echo -e " 5) Deshabilitar/Eliminar Distribución"
+    echo -e " 6) Salir"
     echo -e "${GREEN}====================================================${NC}"
-    read -p "Seleccione una opción [1-6]: " OPCION
+    read -p "Opción: " OPCION
 
     case $OPCION in
-        1) crear_cloudfront; echo ""; read -n 1 -s -r -p "Presione cualquier tecla para continuar..." ;;
-        2) solicitar_acm; echo ""; read -n 1 -s -r -p "Presione cualquier tecla para continuar..." ;;
-        3) crear_cloudflare; echo ""; read -n 1 -s -r -p "Presione cualquier tecla para continuar..." ;;
-        4) listar_distribuciones; echo ""; read -n 1 -s -r -p "Presione cualquier tecla para continuar..." ;;
-        5) eliminar_distribucion; echo ""; read -n 1 -s -r -p "Presione cualquier tecla para continuar..." ;;
-        6) echo -e "\n${YELLOW}Saliendo... ¡Hasta pronto!${NC}\n"; exit 0 ;;
-        *) echo -e "\n${RED}[X] Opción no válida.${NC}"; sleep 2 ;;
+        1) crear_cloudfront ;;
+        2) solicitar_acm ;;
+        3) crear_cloudflare ;;
+        4) listar_distribuciones ;;
+        5) eliminar_distribucion ;;
+        6) exit 0 ;;
+        *) echo "Opción inválida" ;;
     esac
+    read -p "Presione una tecla para continuar..."
 done
 EOF
 
