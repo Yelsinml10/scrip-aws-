@@ -230,7 +230,6 @@ solicitar_acm() {
     
     echo -e "\n${YELLOW}[*] Verificando estado en AWS (esto suele tomar de 1 a 3 minutos, espera un momento)...${NC}"
     
-    # Bucle de verificación (hasta 20 intentos, cada 15 seg = 5 minutos máx)
     for i in {1..20}; do
         STATUS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 --query "Certificate.Status" --output text)
         
@@ -256,7 +255,7 @@ solicitar_acm() {
     fi
 }
 
-# --- 3. Función: Cloudflare Origin CA ---
+# --- 3. Función: Cloudflare Origin CA (ACTUALIZADA PARA TOKENS) ---
 crear_cloudflare() {
     clear
     echo -e "${CYAN}====================================================${NC}"
@@ -267,11 +266,11 @@ crear_cloudflare() {
     echo -e "${YELLOW}Nota: Este es el certificado para tu VPS/Servidor backend.${NC}\n"
     
     read -p "Ingrese el dominio para el certificado (ej. vpn.dominio.com): " CF_DOMAIN
-    read -s -p "Ingrese su Cloudflare Origin CA Key: " CF_API_KEY
+    read -s -p "Ingrese su Token de API de Cloudflare (ej. cfut_...): " CF_API_KEY
     echo -e "\n"
 
     if [ -z "$CF_DOMAIN" ] || [ -z "$CF_API_KEY" ]; then
-        echo -e "${RED}[X] Error: El dominio y la API Key son obligatorios.${NC}"
+        echo -e "${RED}[X] Error: El dominio y el Token de API son obligatorios.${NC}"
         return
     fi
 
@@ -281,8 +280,9 @@ crear_cloudflare() {
 
     CSR_FORMATTED=$(awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}' "$CF_DOMAIN.csr")
 
+    # AQUI ESTA EL CAMBIO: Uso de "Authorization: Bearer" en lugar de "X-Auth-User-Service-Key"
     RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/certificates" \
-        -H "X-Auth-User-Service-Key: $CF_API_KEY" \
+        -H "Authorization: Bearer $CF_API_KEY" \
         -H "Content-Type: application/json" \
         --data '{"hostnames":["'"$CF_DOMAIN"'"],"requested_validity":5475,"request_type":"origin-rsa","csr":"'"$CSR_FORMATTED"'"}')
 
@@ -296,7 +296,8 @@ crear_cloudflare() {
         echo -e "${GREEN}    📜 Ruta certificado   : $(pwd)/$CF_DOMAIN.pem${NC}"
         echo -e "${GREEN}----------------------------------------------------${NC}"
     else
-        echo -e "${RED}[X] Error al generar el certificado.${NC}"
+        echo -e "${RED}[X] Error al generar el certificado en Cloudflare:${NC}"
+        echo "$RESPONSE" | jq -r '.errors[0].message'
     fi
 
     rm -f "$CF_DOMAIN.csr"
